@@ -78,6 +78,27 @@ def load_users(workdir: Path) -> tuple[dict[str, str], set[str], dict[str, str]]
     return names, bots, handles
 
 
+def load_member_channels(workdir: Path) -> set[str]:
+    """IDs of channels/groups the authed user actually joined.
+
+    Slack full-text search returns matches from PUBLIC channels you never
+    joined (e.g. automated `#z-*` notification feeds whose bot username
+    contains your name), so the mention search alone pulls in pure noise.
+    We keep only joined channels. Returns an empty set on failure — callers
+    must treat empty as "unknown, don't filter" so we never drop real data.
+    """
+    run(["slackdump", "list", "channels", "-format", "json", "-q"], cwd=workdir)
+    files = list(workdir.glob("channels-*.json"))
+    if not files:
+        return set()
+    try:
+        data = json.loads(files[0].read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    chans = data if isinstance(data, list) else (data.get("channels") or [])
+    return {c["id"] for c in chans if c.get("is_member") and c.get("id")}
+
+
 # ---------- search ----------
 
 THREAD_TS_RE = re.compile(r"[?&]thread_ts=([0-9.]+)")
@@ -170,6 +191,20 @@ def build_body(conv: dict, users: dict[str, str]) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+def is_noise(conv: dict) -> bool:
+    """A standalone hit whose only message has no body text and no files.
+
+    These render as "(no text)" — content lives in `attachments`/`blocks`
+    (app/webhook notifications), which build_body doesn't surface anyway.
+    Only single-message convs qualify; real threads (with replies) never do.
+    """
+    msgs = conv.get("messages") or []
+    if len(msgs) != 1:
+        return False
+    m = msgs[0]
+    return not (m.get("text") or "").strip() and not (m.get("files") or [])
+
+
 def slugify(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", s.lower())
 
@@ -251,14 +286,21 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         workdir = Path(td)
         users, bots, handles = load_users(workdir)
+        member_channels = load_member_channels(workdir)
+        if member_channels:
+            sys.stderr.write(f"member channels: {len(member_channels)} joined\n")
 
         threads: dict[tuple, dict] = {}
 
         def ingest(hits: list[dict], category: str, jkey, keep: bool) -> None:
             for h in hits:
-                if h["cid"].startswith("D") and h["channel_name"] in bots:
-                    continue   # skip bot DMs (Jira/Kolide/Google/...)
-                k = (h["cid"], h["root"], category, jkey)
+                cid = h["cid"]
+                if cid.startswith("D"):
+                    if h["channel_name"] in bots:
+                        continue   # skip bot DMs (Jira/Kolide/Google/...)
+                elif member_channels and cid not in member_channels:
+                    continue   # skip channels I never joined (search-only public hits)
+                k = (cid, h["root"], category, jkey)
                 if k in threads:
                     threads[k]["keep_standalone"] |= keep   # OR across queries
                     continue
@@ -321,6 +363,9 @@ def main() -> int:
             else:
                 skipped += 1
                 continue
+            if is_noise(conv):
+                skipped += 1
+                continue   # "(no text)" app/webhook notification — nothing to render
             write_raw(raw_dir, info, conv, users, owner)
         if skipped:
             sys.stderr.write(f"skipped {skipped} of my own standalone line(s)\n")
