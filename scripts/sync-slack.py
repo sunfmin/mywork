@@ -52,14 +52,16 @@ def run(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
 
 # ---------- users ----------
 
-def load_users(workdir: Path) -> tuple[dict[str, str], set[str]]:
-    """Return (id -> display name, set of bot/deleted ids). Cached by slackdump."""
+def load_users(workdir: Path) -> tuple[dict[str, str], set[str], dict[str, str]]:
+    """Return (id->name, bot/deleted ids, id->handle). handle = the display_name
+    Slack indexes @-mentions under (used as the mention-search keyword)."""
     run(["slackdump", "list", "users", "-format", "json", "-q"], cwd=workdir)
     files = list(workdir.glob("users-*.json"))
     if not files:
-        return {}, set()
+        return {}, set(), {}
     arr = json.loads(files[0].read_text(encoding="utf-8"))
     names: dict[str, str] = {}
+    handles: dict[str, str] = {}
     bots: set[str] = set()
     for u in arr:
         uid = u.get("id")
@@ -69,9 +71,11 @@ def load_users(workdir: Path) -> tuple[dict[str, str], set[str]]:
         nm = (u.get("real_name") or prof.get("real_name")
               or prof.get("display_name") or u.get("name") or uid)
         names[uid] = (nm or uid).strip() or uid
+        handles[uid] = (prof.get("display_name") or u.get("real_name")
+                        or u.get("name") or uid).strip() or uid
         if u.get("is_bot") or u.get("deleted") or uid == "USLACKBOT":
             bots.add(uid)
-    return names, bots
+    return names, bots, handles
 
 
 # ---------- search ----------
@@ -246,31 +250,50 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as td:
         workdir = Path(td)
-        users, bots = load_users(workdir)
+        users, bots, handles = load_users(workdir)
 
-        # thread key (cid, root) -> info; involved first, then by-jira keys.
-        threads: dict[tuple[str, str], dict] = {}
-        queries = [("involved", None, f"from:me after:{cutoff}"),
-                   ("involved", None, f"to:me after:{cutoff}")]
-        queries += [("by-jira", k, k) for k in keys]
+        threads: dict[tuple, dict] = {}
 
-        owner = ""
-        for i, (category, jkey, query) in enumerate(queries):
-            sys.stderr.write(f"search: {query}\n")
-            for h in search_threads(query, workdir, i):
-                if query.startswith("from:me") and not owner:
-                    owner = users.get((h.get("data") or {}).get("user", ""), "")
+        def ingest(hits: list[dict], category: str, jkey, keep: bool) -> None:
+            for h in hits:
                 if h["cid"].startswith("D") and h["channel_name"] in bots:
                     continue   # skip bot DMs (Jira/Kolide/Google/...)
                 k = (h["cid"], h["root"], category, jkey)
                 if k in threads:
+                    threads[k]["keep_standalone"] |= keep   # OR across queries
                     continue
-                info = {**h, "category": category}
+                info = {**h, "category": category, "keep_standalone": keep}
                 info["permalink"] = root_permalink(h["host"], h["cid"], h["root"])
                 if category == "by-jira":
                     info["jira_key"] = jkey
                     info["jira_summary"] = jira_summary(comms, jkey)
                 threads[k] = info
+
+        # from:me also reveals who "me" is: owner name (for the "(me)" marker)
+        # and owner handle (display_name — how Slack indexes @-mentions).
+        sys.stderr.write(f"search: from:me after:{cutoff}\n")
+        fromme = search_threads(f"from:me after:{cutoff}", workdir, 0)
+        owner = owner_handle = ""
+        for h in fromme:
+            if (uid := (h.get("data") or {}).get("user")):
+                owner, owner_handle = users.get(uid, ""), handles.get(uid, "")
+                break
+        ingest(fromme, "involved", None, keep=False)   # my own stray lines: drop if standalone
+
+        # to:me + mention-of-me catch threads I'm in OR @-mentioned in (the
+        # latter is invisible to to:me — e.g. channel posts that tag me); plus
+        # each Jira key. These keep standalone hits (someone else's signal to me).
+        i, involved_q = 1, [f"to:me after:{cutoff}"]
+        if owner_handle:
+            involved_q.append(f"{owner_handle} after:{cutoff}")   # mention search
+        for q in involved_q:
+            sys.stderr.write(f"search: {q}\n")
+            ingest(search_threads(q, workdir, i), "involved", None, keep=True)
+            i += 1
+        for key in keys:
+            sys.stderr.write(f"search: {key}\n")
+            ingest(search_threads(key, workdir, i), "by-jira", key, keep=True)
+            i += 1
 
         if not threads:
             sys.stderr.write("no threads found.\n")
@@ -284,23 +307,23 @@ def main() -> int:
         sys.stderr.write(f"dumping {len(ids)} thread(s)...\n")
         run(["slackdump", "dump", "-files=false", "-o", str(dumpdir), *ids])
 
-        # `slackdump dump cid:ts` only emits a file when ts is a real thread
-        # (has replies). Standalone messages produce nothing: for involved
-        # those are just chat fragments (skip), but a by-jira hit IS the signal,
-        # so synthesize a one-message conversation from the search payload.
+        # dump cid:ts emits a file only for real threads (with replies). For a
+        # standalone message we synthesize a one-message conv from the full search
+        # payload — but only when worth keeping (mentions me / DM to me / Jira),
+        # not my own stray one-liners.
         skipped = 0
         for info in threads.values():
             jf = dumpdir / f"{info['cid']}-{info['root']}.json"
             if jf.exists():
                 conv = json.loads(jf.read_text(encoding="utf-8"))
-            elif info["category"] == "by-jira" and info.get("data"):
+            elif info.get("keep_standalone") and info.get("data"):
                 conv = {"name": info["channel_name"], "messages": [info["data"]]}
             else:
                 skipped += 1
                 continue
             write_raw(raw_dir, info, conv, users, owner)
         if skipped:
-            sys.stderr.write(f"skipped {skipped} standalone (non-thread) message(s)\n")
+            sys.stderr.write(f"skipped {skipped} of my own standalone line(s)\n")
 
     # Single renderer, shared with the agent path.
     r = run([sys.executable, str(RENDER), "--comms", str(comms)])

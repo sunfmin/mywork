@@ -51,15 +51,28 @@ single source of truth in `_raw/`; the `.md` files are derived (idempotent).
 
 If `slackdump` is installed and a workspace is authenticated (one-time
 `slackdump workspace new`), `sync-slack.py` does everything with no agent:
-searches `from:me` / `to:me` (bounded by `--days`) + each Jira key, dumps each
-matching thread, converts to `comms/slack/_raw/*.txt`, and runs `render-slack.py`.
-It's cron-able. Notes:
+runs three involved searches + each Jira key, dumps each matching thread,
+converts to `comms/slack/_raw/*.txt`, and runs `render-slack.py`. It's cron-able.
 
+The involved searches (all bounded by `--days`):
+- `from:me` — threads I posted in.
+- `to:me` — DMs / direct address to me.
+- **`<my display_name>`** — catches channel posts that **@-mention me** but aren't
+  "to" me (e.g. pairing-session summaries that tag me as a participant). Slack
+  indexes `<@U…>` mentions under the *display_name*, so the bare name as a keyword
+  finds them; `to:me` and `@name` do **not**. (Keyword ⇒ may also match the literal
+  word — usually still "about me", occasionally a false hit.)
+
+Notes:
 - It owns the slack output: each run wipes `_raw/*.txt` + `involved|by-jira/*.md`
   and regenerates. Exit `2` = slackdump absent, `3` = not authenticated.
 - More complete than Path 2 (slackdump paginates the full window; the MCP search
-  caps at ~20 hits/query). Standalone (non-thread) chat fragments are skipped for
-  *involved*; a standalone by-jira hit is synthesized from the search payload.
+  caps at ~20 hits/query, and can't see mention-only posts).
+- Standalone (non-thread) posts: kept when they mention me / are a DM to me / are
+  a Jira hit (synthesized from the **full** search payload — text isn't truncated);
+  my own stray one-liners are dropped.
+- Identity (who "me" is, and my display_name for the mention search) is learned
+  at runtime from the `from:me` results — nothing hardcoded.
 
 ## Path 2 — agent fetches → script renders (fallback)
 
