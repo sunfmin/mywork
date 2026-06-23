@@ -32,16 +32,15 @@ python3 ~/.claude/skills/mywork/scripts/sync-jira.py --out ./comms
 #   add --all for every involved issue (can be large)
 ```
 
-Then do the **Slack step**. There are two paths — **pick by whether
-[`slackdump`](https://github.com/rusq/slackdump) is installed**:
+Then do the **Slack step**. There are two paths. Just run `sync-slack.py` — it
+self-detects [`slackdump`](https://github.com/rusq/slackdump) and signals via its
+exit code which path applies:
 
 ```bash
-if command -v slackdump >/dev/null && slackdump workspace list 2>/dev/null | grep -q '=>'; then
-  # PATH 1 — headless, no agent, cron-able.
-  python3 ~/.claude/skills/mywork/scripts/sync-slack.py --comms ./comms   # --days 14
-else
-  : # PATH 2 — agent-driven fetch (below), then render-slack.py
-fi
+python3 ~/.claude/skills/mywork/scripts/sync-slack.py --comms ./comms   # --days 14
+#   exit 0  -> done, headless (Path 1)
+#   exit 2  -> slackdump not installed     } do Path 2
+#   exit 3  -> slackdump not authenticated } (agent fetch, below)
 ```
 
 Both paths converge on the **same** `render-slack.py`, so the Markdown output is
