@@ -32,14 +32,42 @@ python3 ~/.claude/skills/mywork/scripts/sync-jira.py --out ./comms
 #   add --all for every involved issue (can be large)
 ```
 
-Then do the **Slack step** below. *Fetching* needs the in-session Slack MCP
-tools (only an MCP client can call the claude.ai connector), so that part is
-agent-driven — not a cron script. *Formatting* is **not**: the agent dumps each
-`slack_read_thread` result **verbatim** to a raw file, then a script renders the
-Markdown. The raw MCP output is the single source of truth; re-rendering is
-idempotent and costs no model tokens.
+Then do the **Slack step**. There are two paths — **pick by whether
+[`slackdump`](https://github.com/rusq/slackdump) is installed**:
 
-## Slack step (agent fetches → script renders)
+```bash
+if command -v slackdump >/dev/null && slackdump workspace list 2>/dev/null | grep -q '=>'; then
+  # PATH 1 — headless, no agent, cron-able.
+  python3 ~/.claude/skills/mywork/scripts/sync-slack.py --comms ./comms   # --days 14
+else
+  : # PATH 2 — agent-driven fetch (below), then render-slack.py
+fi
+```
+
+Both paths converge on the **same** `render-slack.py`, so the Markdown output is
+identical in shape. The raw `slack_read_thread` / `slackdump dump` output is the
+single source of truth in `_raw/`; the `.md` files are derived (idempotent).
+
+## Path 1 — slackdump (headless)
+
+If `slackdump` is installed and a workspace is authenticated (one-time
+`slackdump workspace new`), `sync-slack.py` does everything with no agent:
+searches `from:me` / `to:me` (bounded by `--days`) + each Jira key, dumps each
+matching thread, converts to `comms/slack/_raw/*.txt`, and runs `render-slack.py`.
+It's cron-able. Notes:
+
+- It owns the slack output: each run wipes `_raw/*.txt` + `involved|by-jira/*.md`
+  and regenerates. Exit `2` = slackdump absent, `3` = not authenticated.
+- More complete than Path 2 (slackdump paginates the full window; the MCP search
+  caps at ~20 hits/query). Standalone (non-thread) chat fragments are skipped for
+  *involved*; a standalone by-jira hit is synthesized from the search payload.
+
+## Path 2 — agent fetches → script renders (fallback)
+
+Use when `slackdump` is not installed. *Fetching* needs the in-session Slack MCP
+tools (only an MCP client can call the claude.ai connector), so it's agent-driven
+— not cron-able. The agent dumps each `slack_read_thread` result **verbatim** to
+a raw file; `render-slack.py` then formats it (no model tokens spent on layout).
 
 Default window: **last 14 days** (compute the unix cutoff, pass as `after=`).
 
@@ -127,7 +155,11 @@ for Slack, overwrite the `_raw/*.txt` dumps and re-run `render-slack.py` (the
 - **acli**, authenticated to your Jira site (`acli auth login`).
 - **inspecting-jira-issues** skill (does the per-issue Markdown rendering):
   `npx skills add sunfmin/inspecting-jira-issues`
-- **Slack** connected as an MCP tool in the session (for the Slack step).
+- **Slack**, either path:
+  - *Path 1* — [`slackdump`](https://github.com/rusq/slackdump) installed
+    (`brew install slackdump`) + authenticated (`slackdump workspace new`).
+    Fully headless / cron-able.
+  - *Path 2* — Slack connected as an MCP tool in the session (agent-driven).
 
 The Jira script auto-locates `jira-to-markdown.py` under `~/.claude/skills/` or
 `~/.agents/skills/` (override with the `JIRA_TO_MARKDOWN` env var).
