@@ -170,13 +170,16 @@ def slugify(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", s.lower())
 
 
-def write_raw(raw_dir: Path, info: dict, conv: dict, users: dict[str, str]) -> None:
+def write_raw(raw_dir: Path, info: dict, conv: dict, users: dict[str, str],
+              owner: str = "") -> None:
     cid, root = info["cid"], info["root"]
     kind = "dm" if cid.startswith("D") else "channel"
     date = datetime.fromtimestamp(float(root)).strftime("%Y%m%d")
     sec = root.split(".")[0]
     meta = {"kind": kind, "channel_id": cid, "thread_ts": root,
             "permalink": info["permalink"], "category": info["category"]}
+    if owner:
+        meta["owner"] = owner
     if kind == "dm":
         peer = users.get(info["channel_name"], info["channel_name"])
         meta["peer"] = peer
@@ -251,9 +254,12 @@ def main() -> int:
                    ("involved", None, f"to:me after:{cutoff}")]
         queries += [("by-jira", k, k) for k in keys]
 
+        owner = ""
         for i, (category, jkey, query) in enumerate(queries):
             sys.stderr.write(f"search: {query}\n")
             for h in search_threads(query, workdir, i):
+                if query.startswith("from:me") and not owner:
+                    owner = users.get((h.get("data") or {}).get("user", ""), "")
                 if h["cid"].startswith("D") and h["channel_name"] in bots:
                     continue   # skip bot DMs (Jira/Kolide/Google/...)
                 k = (h["cid"], h["root"], category, jkey)
@@ -292,7 +298,7 @@ def main() -> int:
             else:
                 skipped += 1
                 continue
-            write_raw(raw_dir, info, conv, users)
+            write_raw(raw_dir, info, conv, users, owner)
         if skipped:
             sys.stderr.write(f"skipped {skipped} standalone (non-thread) message(s)\n")
 
