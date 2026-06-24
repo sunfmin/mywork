@@ -44,8 +44,8 @@ python3 ~/.claude/skills/mywork/scripts/sync-slack.py --comms ./comms   # --days
 #   exit 3  -> slackdump not authenticated } (agent fetch, below)
 #   --jobs N             run N searches concurrently (default 5)
 #   --refresh-channels   force-refresh the joined-channels cache (else ~weekly)
-#   --keep-group-dms     keep mpdm-* group DMs (群聊私信); dropped by default
-#   --exclude-channels   drop channels by name glob, e.g. 'china,*-cn,team-*'
+#   --exclude-channels   drop channels by name glob, e.g. 'china,*-cn,mpdm-*'
+#                        (group DMs / 群聊私信 are the mpdm-* ones)
 ```
 
 Both paths converge on the **same** `render-slack.py`, so the Markdown output is
@@ -89,11 +89,12 @@ Speed (all searches are independent slackdump processes, so the sync fans out):
   it's **cached** in `comms/slack/_member_channels.json` and refreshed at most
   weekly. Force a refresh with `--refresh-channels`.
 
-Noise filtering:
-- Multi-person group DMs (Slack `mpdm-*`, i.e. 群聊私信) are dropped by default;
-  pass `--keep-group-dms` to keep them.
-- `--exclude-channels 'china,*-cn,team-*'` drops channels by name glob
+Channel filtering — nothing is dropped by default; exclude explicitly:
+- `--exclude-channels 'china,*-cn,mpdm-*'` drops channels by name glob
   (case-insensitive) — the Slack analogue of Jira's `--exclude-projects`.
+- Multi-person group DMs (群聊私信) are named `mpdm-*`, so `mpdm-*` drops them.
+- (Search-only hits from public channels you never joined are always filtered
+  out via the joined-channels set, independent of `--exclude-channels`.)
 
 ## Path 2 — agent fetches → script renders (fallback)
 

@@ -311,13 +311,10 @@ def main() -> int:
     ap.add_argument("--refresh-channels", action="store_true",
                     help="force-refresh the cached joined-channels set "
                          "(otherwise reused for up to 7 days)")
-    ap.add_argument("--keep-group-dms", action="store_true",
-                    help="keep multi-person group DMs (Slack 'mpdm-*' channels, "
-                         "i.e. 群聊私信); by default they're dropped as noise")
     ap.add_argument("--exclude-channels", default="",
                     help="comma-separated channel-name globs to drop, e.g. "
-                         "'china,*-cn,team-*' (case-insensitive; like Jira's "
-                         "--exclude-projects)")
+                         "'china,*-cn,mpdm-*' (case-insensitive; like Jira's "
+                         "--exclude-projects). Group DMs (群聊私信) are 'mpdm-*'.")
     args = ap.parse_args()
 
     if not have_slackdump():
@@ -355,7 +352,6 @@ def main() -> int:
 
         threads: dict[tuple, dict] = {}
         member_channels: set[str] = set()
-        drop_group_dms = not args.keep_group_dms
         exclude_pats = [p.strip().lower() for p in args.exclude_channels.split(",")
                         if p.strip()]
 
@@ -363,8 +359,6 @@ def main() -> int:
             for h in hits:
                 cid = h["cid"]
                 cname = h.get("channel_name") or ""
-                if drop_group_dms and cname.startswith("mpdm-"):
-                    continue   # multi-person group DM (群聊私信) — see --keep-group-dms
                 if exclude_pats and any(
                         fnmatch.fnmatch(cname.lower(), p) for p in exclude_pats):
                     continue   # explicitly excluded channel (--exclude-channels)
