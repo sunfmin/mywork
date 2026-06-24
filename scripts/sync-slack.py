@@ -22,12 +22,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -99,6 +101,49 @@ def load_member_channels(workdir: Path) -> set[str]:
     return {c["id"] for c in chans if c.get("is_member") and c.get("id")}
 
 
+def member_channels_cached(comms: Path, workdir: Path, refresh: bool,
+                           ttl_days: int = 7) -> set[str]:
+    """The set of joined-channel IDs, cached locally so we don't pay the price.
+
+    `slackdump list channels` walks the *entire* workspace channel list to learn
+    which ones you're a member of — measured at 16-74s and rate-limit-prone, the
+    single most expensive call in the sync. But the set of channels you've joined
+    changes rarely, so we persist it to ``comms/slack/_member_channels.json`` and
+    refresh at most once per ``ttl_days`` (or on ``--refresh-channels``). A failed
+    refresh falls back to the stale cache rather than dropping the noise filter.
+    """
+    cache = comms / "slack" / "_member_channels.json"
+
+    def read_cache() -> dict | None:
+        try:
+            return json.loads(cache.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    if not refresh and (d := read_cache()) is not None:
+        try:
+            age = datetime.now(timezone.utc) - datetime.fromisoformat(d["fetched"])
+            if age < timedelta(days=ttl_days):
+                return set(d.get("ids") or [])
+        except Exception:
+            pass
+
+    ids = load_member_channels(workdir)
+    if ids:
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(
+                {"fetched": datetime.now(timezone.utc).isoformat(),
+                 "ids": sorted(ids)}), encoding="utf-8")
+        except OSError:
+            pass
+        return ids
+    # Fetch failed/empty — prefer a stale cache over losing the filter entirely.
+    if (d := read_cache()) is not None:
+        return set(d.get("ids") or [])
+    return set()
+
+
 # ---------- search ----------
 
 THREAD_TS_RE = re.compile(r"[?&]thread_ts=([0-9.]+)")
@@ -108,7 +153,12 @@ def search_threads(query: str, workdir: Path, idx: int) -> list[dict]:
     """Run one search; return [{cid, root, channel_name, permalink, host}]."""
     out = workdir / f"search_{idx}"
     out.mkdir(parents=True, exist_ok=True)
-    r = run(["slackdump", "search", "messages", "-o", str(out), query])
+    # -no-channel-users: skip fetching the member list of every channel a hit
+    #   lands in (~2x faster on large result sets). We only read SEARCH_MESSAGE
+    #   rows (channel id/name, ts, permalink, author) — never channel users —
+    #   so this drops nothing we use. -files=false: don't download attachments.
+    r = run(["slackdump", "search", "messages", "-no-channel-users",
+             "-files=false", "-o", str(out), query])
     db = out / "slackdump.sqlite"
     if not db.exists():
         sys.stderr.write(f"  (search '{query}' produced no db)\n")
@@ -255,6 +305,19 @@ def main() -> int:
     ap.add_argument("--comms", default="./comms", type=Path)
     ap.add_argument("--days", type=int, default=14,
                     help="involved window for from:me / to:me (default 14)")
+    ap.add_argument("--jobs", type=int, default=5,
+                    help="run this many slackdump searches concurrently "
+                         "(default 5; each search is an independent process)")
+    ap.add_argument("--refresh-channels", action="store_true",
+                    help="force-refresh the cached joined-channels set "
+                         "(otherwise reused for up to 7 days)")
+    ap.add_argument("--keep-group-dms", action="store_true",
+                    help="keep multi-person group DMs (Slack 'mpdm-*' channels, "
+                         "i.e. 群聊私信); by default they're dropped as noise")
+    ap.add_argument("--exclude-channels", default="",
+                    help="comma-separated channel-name globs to drop, e.g. "
+                         "'china,*-cn,team-*' (case-insensitive; like Jira's "
+                         "--exclude-projects)")
     args = ap.parse_args()
 
     if not have_slackdump():
@@ -285,16 +348,26 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as td:
         workdir = Path(td)
+        # Warm the user cache serially (cheap, ~2s) so the concurrent search
+        # fleet below reads it instead of racing to populate it. We need the
+        # user map for name resolution regardless.
         users, bots, handles = load_users(workdir)
-        member_channels = load_member_channels(workdir)
-        if member_channels:
-            sys.stderr.write(f"member channels: {len(member_channels)} joined\n")
 
         threads: dict[tuple, dict] = {}
+        member_channels: set[str] = set()
+        drop_group_dms = not args.keep_group_dms
+        exclude_pats = [p.strip().lower() for p in args.exclude_channels.split(",")
+                        if p.strip()]
 
         def ingest(hits: list[dict], category: str, jkey, keep: bool) -> None:
             for h in hits:
                 cid = h["cid"]
+                cname = h.get("channel_name") or ""
+                if drop_group_dms and cname.startswith("mpdm-"):
+                    continue   # multi-person group DM (群聊私信) — see --keep-group-dms
+                if exclude_pats and any(
+                        fnmatch.fnmatch(cname.lower(), p) for p in exclude_pats):
+                    continue   # explicitly excluded channel (--exclude-channels)
                 if cid.startswith("D"):
                     if h["channel_name"] in bots:
                         continue   # skip bot DMs (Jira/Kolide/Google/...)
@@ -311,31 +384,52 @@ def main() -> int:
                     info["jira_summary"] = jira_summary(comms, jkey)
                 threads[k] = info
 
-        # from:me also reveals who "me" is: owner name (for the "(me)" marker)
-        # and owner handle (display_name — how Slack indexes @-mentions).
-        sys.stderr.write(f"search: from:me after:{cutoff}\n")
-        fromme = search_threads(f"from:me after:{cutoff}", workdir, 0)
-        owner = owner_handle = ""
-        for h in fromme:
-            if (uid := (h.get("data") or {}).get("user")):
-                owner, owner_handle = users.get(uid, ""), handles.get(uid, "")
-                break
-        ingest(fromme, "involved", None, keep=False)   # my own stray lines: drop if standalone
+        # Every search is an independent slackdump process writing its own
+        # search_<idx> dir, so fan them all out. Two ordering dependencies:
+        #   - the mention-of-me search needs owner_handle, learned from from:me;
+        #   - ingest()'s noise filter needs member_channels.
+        # So: launch the identity-free searches + the (cached) channel fetch at
+        # once, resolve from:me to fire the mention search, then ingest in a
+        # deterministic order once every result is materialized.
+        sys.stderr.write(
+            f"searching: from:me, to:me, mention + {len(keys)} jira key(s) "
+            f"({args.jobs} parallel)\n")
+        fromme = owner = owner_handle = None
+        with ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
+            # Joined-channels set is cached locally (refreshed ~weekly); when it
+            # does hit the network its 16-74s cost overlaps the searches here.
+            f_chans = ex.submit(member_channels_cached, comms, workdir,
+                                args.refresh_channels)
+            f_fromme = ex.submit(search_threads, f"from:me after:{cutoff}", workdir, 0)
+            f_tome = ex.submit(search_threads, f"to:me after:{cutoff}", workdir, 1)
+            f_jira = [(key, ex.submit(search_threads, key, workdir, 2 + n))
+                      for n, key in enumerate(keys)]
 
-        # to:me + mention-of-me catch threads I'm in OR @-mentioned in (the
-        # latter is invisible to to:me — e.g. channel posts that tag me); plus
-        # each Jira key. These keep standalone hits (someone else's signal to me).
-        i, involved_q = 1, [f"to:me after:{cutoff}"]
-        if owner_handle:
-            involved_q.append(f"{owner_handle} after:{cutoff}")   # mention search
-        for q in involved_q:
-            sys.stderr.write(f"search: {q}\n")
-            ingest(search_threads(q, workdir, i), "involved", None, keep=True)
-            i += 1
-        for key in keys:
-            sys.stderr.write(f"search: {key}\n")
-            ingest(search_threads(key, workdir, i), "by-jira", key, keep=True)
-            i += 1
+            # from:me reveals who "me" is: owner name (for the "(me)" marker) and
+            # owner handle (display_name — how Slack indexes @-mentions).
+            fromme = f_fromme.result() or []
+            owner = owner_handle = ""
+            for h in fromme:
+                if (uid := (h.get("data") or {}).get("user")):
+                    owner, owner_handle = users.get(uid, ""), handles.get(uid, "")
+                    break
+            # mention-of-me catches channel posts that tag me but aren't "to" me.
+            f_mention = (ex.submit(search_threads, f"{owner_handle} after:{cutoff}",
+                                   workdir, 2 + len(keys)) if owner_handle else None)
+
+            member_channels = f_chans.result()
+            if member_channels:
+                sys.stderr.write(f"member channels: {len(member_channels)} joined\n")
+
+        # Ingest deterministically (futures are all complete after the pool
+        # closes). from:me first — my own stray lines drop if standalone; to:me /
+        # mention / jira keep standalone hits (someone else's signal to me).
+        ingest(fromme, "involved", None, keep=False)
+        ingest(f_tome.result() or [], "involved", None, keep=True)
+        if f_mention is not None:
+            ingest(f_mention.result() or [], "involved", None, keep=True)
+        for key, fut in f_jira:
+            ingest(fut.result() or [], "by-jira", key, keep=True)
 
         if not threads:
             sys.stderr.write("no threads found.\n")

@@ -16,6 +16,10 @@ Usage:
   --exclude-projects    Comma-separated project keys to skip (e.g. SEC for
                         automated dependency-scan noise). Default: none.
   --subtasks            Also dump each issue's sub-tickets (default: off).
+  --jobs N              Render this many issues concurrently (default: 6). Each
+                        issue is an independent REST fetch, so this is a near-
+                        linear speedup; the acli token is refreshed once up
+                        front (acli_site), so the workers don't race on it.
 
 "Involved" = assignee OR reporter OR watcher = currentUser().
 
@@ -35,6 +39,7 @@ import os
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Statuses that are terminal but sometimes mis-categorised in Jira (their
@@ -106,6 +111,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--days", type=int, default=0)
     ap.add_argument("--exclude-projects", default="")
     ap.add_argument("--subtasks", action="store_true")
+    ap.add_argument("--jobs", type=int, default=6,
+                    help="render this many issues concurrently (default 6)")
     args = ap.parse_args(argv[1:])
 
     dump = find_jira_dump()
@@ -140,16 +147,25 @@ def main(argv: list[str]) -> int:
         env["JIRA_SITE"] = site
 
     extra = [] if args.subtasks else ["--no-subtasks"]
-    done = 0
-    for key in keys:
+
+    def render(key: str) -> tuple[str, int, str]:
         cmd = [sys.executable, str(dump), key, str(jira_dir / key), *extra]
         proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
-        if proc.returncode == 0:
-            done += 1
-            print(f"synced: {key}")
-        else:
-            tail = (proc.stderr or proc.stdout).strip().splitlines()
-            print(f"FAILED {key}: {tail[-1] if tail else '?'}", file=sys.stderr)
+        return key, proc.returncode, (proc.stderr or proc.stdout)
+
+    # Each issue is an independent REST fetch; render them concurrently. The
+    # acli OAuth token was already refreshed by acli_site() above, so the
+    # workers read the fresh keychain token without racing to refresh it.
+    done = 0
+    workers = max(1, min(args.jobs, len(keys))) if keys else 1
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for key, rc, out in ex.map(render, keys):
+            if rc == 0:
+                done += 1
+                print(f"synced: {key}")
+            else:
+                tail = out.strip().splitlines()
+                print(f"FAILED {key}: {tail[-1] if tail else '?'}", file=sys.stderr)
 
     (jira_dir / "_keys.txt").write_text("\n".join(keys) + ("\n" if keys else ""))
     print(f"\nJira: {done}/{len(keys)} issue(s) → {jira_dir}", file=sys.stderr)

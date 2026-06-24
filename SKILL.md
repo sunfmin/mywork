@@ -30,6 +30,7 @@ python3 ~/.claude/skills/mywork/scripts/sync-jira.py --out ./comms
 #   add --days 90 to include recently-touched closed issues
 #   add --exclude-projects SEC to skip automated dependency-scan tickets
 #   add --all for every involved issue (can be large)
+#   --jobs N  renders N issues concurrently (default 6) — near-linear speedup
 ```
 
 Then do the **Slack step**. There are two paths. Just run `sync-slack.py` — it
@@ -41,6 +42,10 @@ python3 ~/.claude/skills/mywork/scripts/sync-slack.py --comms ./comms   # --days
 #   exit 0  -> done, headless (Path 1)
 #   exit 2  -> slackdump not installed     } do Path 2
 #   exit 3  -> slackdump not authenticated } (agent fetch, below)
+#   --jobs N             run N searches concurrently (default 5)
+#   --refresh-channels   force-refresh the joined-channels cache (else ~weekly)
+#   --keep-group-dms     keep mpdm-* group DMs (群聊私信); dropped by default
+#   --exclude-channels   drop channels by name glob, e.g. 'china,*-cn,team-*'
 ```
 
 Both paths converge on the **same** `render-slack.py`, so the Markdown output is
@@ -73,6 +78,22 @@ Notes:
   my own stray one-liners are dropped.
 - Identity (who "me" is, and my display_name for the mention search) is learned
   at runtime from the `from:me` results — nothing hardcoded.
+
+Speed (all searches are independent slackdump processes, so the sync fans out):
+- Searches run concurrently (`--jobs`, default 5); the `from:me` → mention-search
+  dependency is the only serialization point.
+- Searches pass `-no-channel-users -files=false` — ~2× faster on large result
+  sets, and lossless (we read only the `SEARCH_MESSAGE` rows, never channel users).
+- The joined-channels set (used to drop search-only public hits) is the single
+  most expensive call (`slackdump list channels`, ~15-75s, rate-limit-prone), so
+  it's **cached** in `comms/slack/_member_channels.json` and refreshed at most
+  weekly. Force a refresh with `--refresh-channels`.
+
+Noise filtering:
+- Multi-person group DMs (Slack `mpdm-*`, i.e. 群聊私信) are dropped by default;
+  pass `--keep-group-dms` to keep them.
+- `--exclude-channels 'china,*-cn,team-*'` drops channels by name glob
+  (case-insensitive) — the Slack analogue of Jira's `--exclude-projects`.
 
 ## Path 2 — agent fetches → script renders (fallback)
 
