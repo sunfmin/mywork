@@ -28,13 +28,13 @@ This is an agent skill. In Claude Code, invoke it (e.g. `/mywork`) and it will:
 
 1. Run the headless Jira sync:
    ```bash
-   python3 scripts/sync-jira.py --out ./comms [--days 90] [--exclude-projects SEC] [--all]
+   python3 skills/mywork/scripts/sync-jira.py --out ./comms [--days 90] [--exclude-projects SEC] [--all]
    ```
 2. Pull your Slack activity (mentions, DMs, threads you're in) and any threads
    mentioning your Jira keys, via the Slack MCP tools.
 
-Output lands in `./comms/` (`jira/` + `slack/`). See `SKILL.md` for the full
-procedure and the output layout.
+Output lands in `./comms/` (`jira/` + `slack/`). See `skills/mywork/SKILL.md` for
+the full procedure and the output layout.
 
 ## Jira scope flags
 
